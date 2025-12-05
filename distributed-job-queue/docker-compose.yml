@@ -1,0 +1,161 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: djq-postgres
+    environment:
+      POSTGRES_USER: jobqueue
+      POSTGRES_PASSWORD: jobqueue123
+      POSTGRES_DB: jobqueue_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobqueue"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - jobqueue-network
+
+  # RabbitMQ Message Broker
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: djq-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin123
+    ports:
+      - "5672:5672"    # AMQP port
+      - "15672:15672"  # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - jobqueue-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: djq-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - jobqueue-network
+
+  # FastAPI Application
+  api:
+    build:
+      context: .
+      dockerfile: ./api/Dockerfile
+    container_name: djq-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://jobqueue:jobqueue123@postgres:5432/jobqueue_db
+      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672/
+      REDIS_URL: redis://redis:6379/0
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      LOG_LEVEL: INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./api:/app
+    networks:
+      - jobqueue-network
+    restart: unless-stopped
+
+  # Worker Processes
+  worker:
+    build:
+      context: .
+      dockerfile: ./worker/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://jobqueue:jobqueue123@postgres:5432/jobqueue_db
+      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672/
+      REDIS_URL: redis://redis:6379/0
+      WORKER_ID: worker-${WORKER_ID:-1}
+      LOG_LEVEL: INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./worker:/app
+      - ./shared:/shared
+    networks:
+      - jobqueue-network
+    restart: unless-stopped
+    deploy:
+      replicas: 3
+
+  # Job Scheduler
+  scheduler:
+    build:
+      context: .
+      dockerfile: ./scheduler/Dockerfile
+    container_name: djq-scheduler
+    environment:
+      DATABASE_URL: postgresql://jobqueue:jobqueue123@postgres:5432/jobqueue_db
+      RABBITMQ_URL: amqp://admin:admin123@rabbitmq:5672/
+      LOG_LEVEL: INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./scheduler:/app
+      - ./shared:/shared
+    networks:
+      - jobqueue-network
+    restart: unless-stopped
+
+  # Monitoring Dashboard
+  dashboard:
+    build:
+      context: .
+      dockerfile: ./dashboard/Dockerfile
+    container_name: djq-dashboard
+    ports:
+      - "3000:3000"
+    environment:
+      REACT_APP_API_URL: http://localhost:8000
+      REACT_APP_WS_URL: ws://localhost:8000
+    depends_on:
+      - api
+    networks:
+      - jobqueue-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  redis_data:
+
+networks:
+  jobqueue-network:
+    driver: bridge
